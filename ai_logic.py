@@ -1,23 +1,23 @@
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-# Configuración del cliente de DeepSeek
-# Reemplaza con tu API Key real
+
 load_dotenv()
-API_KEY = os.getenv("DEEPSEEK_KEY")
+API_KEY = os.getenv("IA_KEY")
 
 client = OpenAI(
     api_key=API_KEY, 
-    base_url="https://api.deepseek.com"
+    base_url="https://openrouter.ai/api/v1"
 )
 
-def respuesta_llm(prompt: str, instruccion_interna: str, temperatura: float = 0.7) -> str:
+def respuesta_llm(prompt: str, instruccion_interna: str, temperatura: float = 0.9) -> str:
     """
-    Consulta a DeepSeek y devuelve la respuesta como un string.
+    Consulta al modelo MythoMax 13B. 
+    Subimos un poco la temperatura a 0.9 para aprovechar su creatividad.
     """
     try:
         response = client.chat.completions.create(
-            model="deepseek-chat", # O "deepseek-reasoner" si tienes acceso
+            model="gryphe/mythomax-l2-13b",
             messages=[
                 {"role": "system", "content": instruccion_interna},
                 {"role": "user", "content": prompt},
@@ -25,7 +25,10 @@ def respuesta_llm(prompt: str, instruccion_interna: str, temperatura: float = 0.
             temperature=temperatura,
             stream=False
         )
-        # Extraemos el contenido del mensaje de respuesta
         return response.choices[0].message.content
     except Exception as e:
-        return f"Error de conexión con la IA: {str(e)}"
+        if "429" in str(e):
+            return "⚠️ El servidor está algo saturado. Reintenta en unos segundos."
+        if "402" in str(e):
+            return "⚠️ Revisa tu saldo en OpenRouter o el límite de tu API Key."
+        return f"Error de conexión: {str(e)}"

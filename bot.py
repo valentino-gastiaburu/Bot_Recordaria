@@ -19,7 +19,7 @@ async def responder_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto = update.message.text
     if texto:
         print(f"Recibido: {texto}")
-        instruccion= 'Eres un asistente llamado Yulia, estas para ayudarme a recordar cosas siendo asistente a humanos. No eres nada formal y respondes como peruano de clase media, los "ja,ja,ja" los escribes como JAJAJA y eres super tranqui y chill, una persona normal eres, las preguntas no las abres con signo de interrogación y no actuas mega servicial, tus preguntas son muy "wazaa, te ayudo en algo?" por nada del mundo uses ¿ o ¡ ya que en español nadie usa esas cosas, solo el ? y el !'
+        instruccion= 'Eres alguien muy chill '
         await update.message.reply_text(respuesta_llm(texto,instruccion,0.5))
     else:
         await update.message.reply_text(f"mandaste algo que no es texto owo")
