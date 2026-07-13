@@ -585,3 +585,22 @@ def get_first_unresponded_awaiting_reply(user_id: int) -> dict | None:
         .execute()
     )
     return res.data[0] if res.data else None
+
+
+def get_first_unresponded_nudge_for_task(user_id: int, task_id: int, kinds: list) -> dict | None:
+    """Igual que get_first_unresponded_awaiting_reply pero para una tarea puntual y
+    una familia de kinds (ej. checkin/escalation, o reminder_ack/reminder_escalation)
+    — para medir cuánto lleva sin responder ESE hilo de confirmación puntual."""
+    client = get_client()
+    res = (
+        client.table("nudges")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("task_id", task_id)
+        .in_("kind", kinds)
+        .is_("user_responded_at", "null")
+        .order("sent_at")
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None

@@ -13,9 +13,9 @@ JITTER_FRACTION = 0.3
 LONG_BACKOFF_MIN = 360  # tras agotar la curva sin respuesta, se espera bastante más
 BUSY_BUFFER_MIN = 10
 
-AWAITING_REPLY_WINDOW_MIN = 15  # ventana total de insistencia rápida
-AWAITING_REPLY_SEQUENCE_MIN = [1, 2]  # arranca en 1 min, se topa en 2 min (se repite el último valor)
-AWAITING_REPLY_JITTER_SECONDS = 15  # variación en segundos, no en porcentaje
+FAST_CONFIRMATION_WINDOW_MIN = 15  # ventana total de insistencia rápida
+FAST_CONFIRMATION_SEQUENCE_MIN = [1, 2]  # arranca en 1 min, se topa en 2 min (se repite el último valor)
+FAST_CONFIRMATION_JITTER_SECONDS = 15  # variación en segundos, no en porcentaje
 
 _user_locks: dict[int, asyncio.Lock] = {}
 
@@ -46,14 +46,20 @@ def _next_follow_up_delay_min(escalation_level: int, deadline_at, now_utc: datet
     return max(5, round(delay))
 
 
-def _next_awaiting_reply_delay_min(escalation_level: int, elapsed_min: float):
+def _next_fast_confirmation_delay_min(escalation_level: int, elapsed_min: float):
     """Insiste cada 1-2 min (nunca más de 2), con jitter de unos segundos, hasta que el
-    tiempo transcurrido desde el primer intento llegue a AWAITING_REPLY_WINDOW_MIN — ahí
-    devuelve None, momento en que hay que dejar de insistir activamente."""
-    if elapsed_min >= AWAITING_REPLY_WINDOW_MIN:
+    tiempo transcurrido desde el primer intento llegue a FAST_CONFIRMATION_WINDOW_MIN —
+    ahí devuelve None, momento en que hay que dejar de insistir así de rápido.
+
+    Se usa para cualquier cosa que sea, en el fondo, "te pregunté algo puntual y
+    espero un sí/no": ¿ya iniciaste?, ¿confirmas que viste esto?, una pregunta a
+    mitad de charla. Para seguimientos de progreso ("cómo vas con la tarea") se usa
+    en cambio _next_follow_up_delay_min, en bloques grandes — ahí no se espera una
+    confirmación puntual, así que insistir cada 1-2 min sería molesto sin sentido."""
+    if elapsed_min >= FAST_CONFIRMATION_WINDOW_MIN:
         return None
-    base = AWAITING_REPLY_SEQUENCE_MIN[min(escalation_level, len(AWAITING_REPLY_SEQUENCE_MIN) - 1)]
-    jitter_min = random.uniform(-AWAITING_REPLY_JITTER_SECONDS, AWAITING_REPLY_JITTER_SECONDS) / 60
+    base = FAST_CONFIRMATION_SEQUENCE_MIN[min(escalation_level, len(FAST_CONFIRMATION_SEQUENCE_MIN) - 1)]
+    jitter_min = random.uniform(-FAST_CONFIRMATION_JITTER_SECONDS, FAST_CONFIRMATION_JITTER_SECONDS) / 60
     return max(0.5, base + jitter_min)
 
 
@@ -163,19 +169,29 @@ def _process_due_user(state: dict):
             db.log_nudge(user_id, active_task_id, "reminder_ack", message, 0)
             db.append_conversation_message(user_id, "assistant", message)
 
-            next_delay = _next_follow_up_delay_min(0, task.get("deadline_at"), now_utc)
+            next_delay = _next_fast_confirmation_delay_min(0, 0.0)
             db.update_scheduler_state(
                 user_id, (now_utc + timedelta(minutes=next_delay)).isoformat(), "reminder_ack", active_task_id
             )
             return user["telegram_chat_id"], message
 
         last_nudge = db.get_last_nudge_for_task(user_id, active_task_id)
-        if last_nudge and not last_nudge.get("user_responded_at"):
+        if last_nudge and last_nudge["kind"] in ("checkin", "escalation") and not last_nudge.get("user_responded_at"):
             escalation_level = last_nudge["escalation_level"] + 1
             kind = "escalation"
         else:
             escalation_level = 0
             kind = "checkin"
+
+        # "¿ya iniciaste?" es una confirmación puntual (sí/no) — insiste rápido
+        # (1-2 min) los primeros ~15 min; recién si eso se agota sin respuesta cae
+        # al backoff lento normal (consciente del deadline).
+        first_nudge = db.get_first_unresponded_nudge_for_task(user_id, active_task_id, ["checkin", "escalation"])
+        elapsed_min = 0.0 if not first_nudge else (now_utc - db.parse_ts(first_nudge["sent_at"])).total_seconds() / 60
+        fast_delay = _next_fast_confirmation_delay_min(escalation_level, elapsed_min)
+        next_delay = fast_delay if fast_delay is not None else _next_follow_up_delay_min(
+            escalation_level, task.get("deadline_at"), now_utc
+        )
 
         context = _augment_with_unresolved_thread(user_id, {
             "task": {"title": task["title"], "deadline_at": task.get("deadline_at")},
@@ -187,7 +203,6 @@ def _process_due_user(state: dict):
         db.log_nudge(user_id, active_task_id, kind, message, escalation_level)
         db.append_conversation_message(user_id, "assistant", message)
 
-        next_delay = _next_follow_up_delay_min(escalation_level, task.get("deadline_at"), now_utc)
         db.update_scheduler_state(
             user_id, (now_utc + timedelta(minutes=next_delay)).isoformat(), "checkin", active_task_id
         )
@@ -234,12 +249,21 @@ def _process_due_user(state: dict):
             return None
 
         last_nudge = db.get_last_nudge_for_task(user_id, active_task_id)
-        if last_nudge and not last_nudge.get("user_responded_at"):
+        if last_nudge and last_nudge["kind"] in ("reminder_ack", "reminder_escalation") and not last_nudge.get("user_responded_at"):
             escalation_level = last_nudge["escalation_level"] + 1
             kind = "reminder_escalation"
         else:
             escalation_level = 0
             kind = "reminder_ack"
+
+        # "confírmame que lo viste" también es una confirmación puntual — misma
+        # lógica de rápido-primero-luego-lento que en checkin.
+        first_nudge = db.get_first_unresponded_nudge_for_task(
+            user_id, active_task_id, ["reminder_ack", "reminder_escalation"]
+        )
+        elapsed_min = 0.0 if not first_nudge else (now_utc - db.parse_ts(first_nudge["sent_at"])).total_seconds() / 60
+        fast_delay = _next_fast_confirmation_delay_min(escalation_level, elapsed_min)
+        next_delay = fast_delay if fast_delay is not None else _next_follow_up_delay_min(escalation_level, None, now_utc)
 
         context = _augment_with_unresolved_thread(
             user_id, {"task": {"title": task["title"], "description": task.get("description")}}
@@ -249,7 +273,6 @@ def _process_due_user(state: dict):
         db.log_nudge(user_id, active_task_id, kind, message, escalation_level)
         db.append_conversation_message(user_id, "assistant", message)
 
-        next_delay = _next_follow_up_delay_min(escalation_level, None, now_utc)
         db.update_scheduler_state(
             user_id, (now_utc + timedelta(minutes=next_delay)).isoformat(), "reminder_ack", active_task_id
         )
@@ -265,7 +288,7 @@ def _process_due_user(state: dict):
         first_nudge = db.get_first_unresponded_awaiting_reply(user_id)
         elapsed_min = 0.0 if not first_nudge else (now_utc - db.parse_ts(first_nudge["sent_at"])).total_seconds() / 60
 
-        next_delay = _next_awaiting_reply_delay_min(escalation_level, elapsed_min)
+        next_delay = _next_fast_confirmation_delay_min(escalation_level, elapsed_min)
         if next_delay is None:
             # ventana de ~15 min agotada sin respuesta: se libera el cursor. El nudge
             # queda sin user_responded_at en el log — así se puede retomar más adelante
