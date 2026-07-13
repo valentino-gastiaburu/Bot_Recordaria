@@ -18,6 +18,14 @@ client = OpenAI(api_key=API_KEY, base_url="https://api.deepseek.com")
 
 MAX_TOOL_ITERATIONS = 6
 
+
+def _strip_markdown(text: str) -> str:
+    """Telegram no renderiza ** ni _ sin un parse_mode especial — a veces el modelo los usa
+    igual pese a la instrucción, así que se limpian acá como red de seguridad."""
+    text = (text or "").replace("**", "")
+    text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"\1", text)
+    return text
+
 _SCHEDULING_CLAIM_PATTERN = re.compile(
     r"agend|acordad|acordamos|confirmamos|queda(mos)?\s|arrancas?\s+a\s+las|empiezas?\s+a\s+las",
     re.IGNORECASE,
@@ -136,6 +144,31 @@ la lista y acláralo con el usuario en vez de asumir que sí se guardó.
 Nunca inventes ni asumas la hora actual — usa exactamente la que aparece en "Fecha y hora actual
 del usuario" en este mismo mensaje. Si vas a mencionar cuánto falta para algo, calcúlalo a partir
 de esa hora real, nunca de una que te parezca lógica por el contexto de la charla.
+
+Cada mensaje del historial de abajo trae al inicio, entre corchetes, el día y hora real en que se
+mandó, ej. "[lunes 13/07 09:43]". Compara esa fecha con la de HOY (arriba) antes de dar por vigente
+algo que se dijo antes. Si un mensaje viejo dice "hoy" o "esta noche" pero se mandó en un día
+distinto al de hoy, ese plan quedó obsoleto — no lo repitas como si siguiera en pie, replantéalo con
+el usuario. Vuelve a mirar la lista de tareas registradas (la fuente real) en vez de fiarte de lo
+que el chat viejo diga sobre horarios.
+
+Telegram NO interpreta ** ni _ como negrita ni cursiva — si los usas, al usuario le aparecen
+asteriscos o guiones bajos sueltos, feo y confuso. No uses NINGÚN formato tipo markdown (nada de
+**texto**, _texto_, # títulos, listas con -). Escribe todo en texto plano, como un mensaje de
+WhatsApp normal. Si quieres destacar algo, usa mayúsculas puntuales o un emoji, no asteriscos.
+
+Por defecto, asume que el usuario se duerme alrededor de la medianoche (00:00) salvo que te diga
+otra cosa. Cuando armes un plan con varias tareas, suma las horas que dijo que necesita y revisa si
+caben antes de medianoche considerando su horario ocupado (trabajo, clases, etc.). Si no caben,
+dile claramente que va a tener que trasnochar — ej. "uff, para cumplir con esto vas a tener que
+quedarte hasta las 3am, ¿te parece o prefieres ajustar algo?" — no se lo escondas ni lo asumas en
+silencio proponiendo un plan que en realidad no alcanza.
+
+Cuando el usuario mencione un examen, clase u otro evento con una hora de inicio, pregúntale
+también a qué hora termina (o cuánto dura) y regístralo con add_one_off_event — no solo guardes el
+deadline_at de la tarea. Así ese bloque de tiempo queda marcado como ocupado de verdad para cuando
+propongas horarios de estudio más adelante. Antes de llamar a add_one_off_event, revisa con
+get_schedule si ese evento ya está registrado (mismo título/fecha) — si ya existe, no lo dupliques.
 """.strip()
 
 
@@ -161,6 +194,23 @@ def _pending_tasks_context(user_id: int) -> str:
         "NUNCA llames create_task para algo que ya está en esta lista, aunque el usuario lo mencione "
         "con otras palabras o agregue detalles nuevos):\n" + "\n".join(lines)
     )
+
+
+def _format_history_messages(history: list, tz: ZoneInfo) -> list:
+    """Antepone a cada mensaje del historial la fecha/hora local real en que se mandó,
+    para que el modelo pueda distinguir un 'hoy' de ayer de un 'hoy' de verdad."""
+    messages = []
+    for entry in history:
+        role = entry["role"] if entry["role"] in ("user", "assistant") else "user"
+        marker = ""
+        if entry.get("created_at"):
+            try:
+                local_dt = db.parse_ts(entry["created_at"]).astimezone(tz)
+                marker = f"[{local_dt.strftime('%A %d/%m %H:%M')}] "
+            except ValueError:
+                pass
+        messages.append({"role": role, "content": marker + entry["content"]})
+    return messages
 
 
 def _system_prompt(user: dict, user_id: int) -> str:
@@ -280,10 +330,8 @@ def handle_user_message(user_id: int, text: str) -> str:
             "respuesta (sin forzarlo si el usuario ya está hablando de otra cosa importante)."
         )
 
-    messages = [{"role": "system", "content": system_prompt}]
-    for entry in history:
-        role = entry["role"] if entry["role"] in ("user", "assistant") else "user"
-        messages.append({"role": role, "content": entry["content"]})
+    tz = ZoneInfo(user.get("timezone") or "America/Lima")
+    messages = [{"role": "system", "content": system_prompt}] + _format_history_messages(history, tz)
 
     try:
         reply = _chat_with_tools(user_id, messages, text)
@@ -294,6 +342,7 @@ def handle_user_message(user_id: int, text: str) -> str:
             return "⚠️ Revisa tu saldo en DeepSeek o el límite de tu API Key."
         return f"Error de conexión: {str(e)}"
 
+    reply = _strip_markdown(reply)
     db.append_conversation_message(user_id, "assistant", reply)
 
     state = db.get_scheduler_state(user_id)
@@ -347,10 +396,8 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
         "Responde solo con el mensaje que le vas a mandar, nada más."
     )
 
-    messages = [{"role": "system", "content": instruction}]
-    for entry in history:
-        role = entry["role"] if entry["role"] in ("user", "assistant") else "user"
-        messages.append({"role": role, "content": entry["content"]})
+    tz = ZoneInfo(user.get("timezone") or "America/Lima")
+    messages = [{"role": "system", "content": instruction}] + _format_history_messages(history, tz)
     messages.append({"role": "user", "content": "(inicia tú la conversación ahora)"})
 
     response = client.chat.completions.create(
@@ -358,4 +405,4 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
         messages=messages,
         temperature=0.8,
     )
-    return response.choices[0].message.content or ""
+    return _strip_markdown(response.choices[0].message.content or "")
