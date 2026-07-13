@@ -1,6 +1,7 @@
 import os
 import re as _re
 from datetime import datetime, timedelta, timezone as dt_timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -275,21 +276,29 @@ def check_schedule_conflict(user_id: int, candidate_start_at: str, duration_minu
         if start_dt < e_end and end_dt > e_start:
             conflicts.append(f"evento: {e['title']} ({e['start_at']})")
 
-    weekday = start_dt.weekday()
+    # recurring_events guarda start_time/end_time como hora local (wall-clock) del
+    # usuario, no UTC — hay que pasar la candidata a su zona horaria antes de
+    # comparar, si no el chequeo queda desfasado por el offset (bug real: antes se
+    # comparaba la hora local guardada como si fuera UTC).
+    user = get_user_by_id(user_id)
+    tz = ZoneInfo(user.get("timezone") or "America/Lima") if user else ZoneInfo("America/Lima")
+    start_local = start_dt.astimezone(tz)
+
+    weekday = start_local.weekday()
     recurring = (
         client.table("recurring_events")
         .select("title,start_time,end_time")
         .eq("user_id", user_id)
-        .eq("weekday", weekday)
         .eq("active", True)
+        .or_(f"weekday.eq.{weekday},weekday.is.null")  # null = se repite todos los dias
         .execute()
         .data
     )
     for r in recurring:
-        r_start = start_dt.replace(
+        r_start = start_local.replace(
             hour=int(r["start_time"].split(":")[0]), minute=int(r["start_time"].split(":")[1]), second=0, microsecond=0
         )
-        r_end = start_dt.replace(
+        r_end = start_local.replace(
             hour=int(r["end_time"].split(":")[0]), minute=int(r["end_time"].split(":")[1]), second=0, microsecond=0
         )
         if start_dt < r_end and end_dt > r_start:
@@ -325,12 +334,40 @@ def get_task_milestones(task_id: int) -> list[dict]:
 
 # ---------- schedule (recurring / one-off) ----------
 
-def add_recurring_event(user_id: int, title: str, weekday: int, start_time: str, end_time: str) -> dict:
+def add_recurring_event(
+    user_id: int,
+    title: str,
+    weekday: int | None,
+    start_time: str,
+    end_time: str,
+    category: str = "other",
+    requires_transport: bool = False,
+) -> dict:
     client = get_client()
     res = client.table("recurring_events").insert(
-        {"user_id": user_id, "title": title, "weekday": weekday, "start_time": start_time, "end_time": end_time}
+        {
+            "user_id": user_id,
+            "title": title,
+            "weekday": weekday,
+            "start_time": start_time,
+            "end_time": end_time,
+            "category": category,
+            "requires_transport": requires_transport,
+        }
     ).execute()
     return res.data[0]
+
+
+def set_recurring_event_active(user_id: int, event_id: int, active: bool) -> dict | None:
+    client = get_client()
+    res = (
+        client.table("recurring_events")
+        .update({"active": active})
+        .eq("user_id", user_id)
+        .eq("id", event_id)
+        .execute()
+    )
+    return res.data[0] if res.data else None
 
 
 def add_one_off_event(user_id: int, title: str, start_at: str, end_at: str) -> dict:

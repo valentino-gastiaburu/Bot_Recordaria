@@ -55,12 +55,22 @@ INTENT_CODES = {
         "actions": ["log_deferral"],
     },
     "0010": {
-        "description": "Registrar un evento semanal recurrente (ej. una clase).",
+        "description": (
+            "Registrar algo periodico en la vida del usuario (clase, trabajo, o una rutina fija "
+            "como el horario en que suele comer)."
+        ),
         "actions": ["add_recurring_event"],
     },
     "0011": {
         "description": "Registrar un evento puntual con horario (ej. un examen).",
         "actions": ["add_one_off_event"],
+    },
+    "0012": {
+        "description": (
+            "Pausar o reactivar un evento periodico ya registrado (ej. el usuario avisa que esta "
+            "semana no tiene clases por vacaciones, o que ya volvieron)."
+        ),
+        "actions": ["set_recurring_event_active"],
     },
     "1001": {
         "description": (

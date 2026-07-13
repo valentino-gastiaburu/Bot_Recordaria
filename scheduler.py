@@ -92,7 +92,7 @@ def _next_quiet_hours_end(now_local: datetime, quiet_end: str) -> datetime:
 
 def _current_busy_event(user_id: int, now_local: datetime, now_utc: datetime):
     for ev in db.get_recurring_events(user_id):
-        if ev["weekday"] != now_local.weekday():
+        if ev["weekday"] is not None and ev["weekday"] != now_local.weekday():
             continue
         start_t = dt_time.fromisoformat(ev["start_time"])
         end_t = dt_time.fromisoformat(ev["end_time"])

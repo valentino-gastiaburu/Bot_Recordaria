@@ -7,10 +7,14 @@ _WEEKDAY_TO_INT = {
 }
 
 
-def _weekday_to_int(weekday) -> int:
+def _weekday_to_int(weekday) -> int | None:
+    if weekday is None:
+        return None
     if isinstance(weekday, int):
         return weekday
     key = str(weekday).strip().lower()
+    if key in ("diario", "todos_los_dias", "cada_dia", ""):
+        return None
     if key in _WEEKDAY_TO_INT:
         return _WEEKDAY_TO_INT[key]
     return int(key)
@@ -117,9 +121,24 @@ def log_deferral(user_id: int, task_id: int = None, requested_minutes: int = Non
     return db.log_deferral(user_id, task_id, requested_minutes, reason)
 
 
-def add_recurring_event(user_id: int, title: str, weekday, start_time: str, end_time: str) -> dict:
+def add_recurring_event(
+    user_id: int,
+    title: str,
+    weekday,
+    start_time: str,
+    end_time: str,
+    category: str = "other",
+    requires_transport: bool = False,
+) -> dict:
     weekday_int = _weekday_to_int(weekday)
-    event = db.add_recurring_event(user_id, title, weekday_int, start_time, end_time)
+    event = db.add_recurring_event(user_id, title, weekday_int, start_time, end_time, category, requires_transport)
+    return {"event": event}
+
+
+def set_recurring_event_active(user_id: int, event_id: int, active: bool) -> dict:
+    event = db.set_recurring_event_active(user_id, event_id, active)
+    if not event:
+        return {"error": "event_not_found"}
     return {"event": event}
 
 
@@ -163,6 +182,7 @@ TOOL_FUNCTIONS = {
     "mark_task_done": mark_task_done,
     "log_deferral": log_deferral,
     "add_recurring_event": add_recurring_event,
+    "set_recurring_event_active": set_recurring_event_active,
     "add_one_off_event": add_one_off_event,
     "get_schedule": get_schedule,
     "get_recent_leisure_summary": get_recent_leisure_summary,
@@ -341,16 +361,58 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "add_recurring_event",
-            "description": "Registra un evento semanal recurrente del usuario, como una clase todos los lunes.",
+            "description": (
+                "Registra algo que se repite periódicamente en la vida del usuario: una clase, el "
+                "trabajo, o una rutina fija como el horario en que suele almorzar/cenar. Úsalo también "
+                "para aprender su rutina diaria (comidas, gimnasio, etc.), no solo clases."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
-                    "weekday": {"type": "string", "description": "Día de la semana en español, ej. 'lunes'"},
+                    "weekday": {
+                        "type": "string",
+                        "description": (
+                            "Día de la semana en español (ej. 'lunes'), o 'diario' si se repite todos "
+                            "los días (ej. la hora en que suele almorzar)."
+                        ),
+                    },
                     "start_time": {"type": "string", "description": "Hora de inicio HH:MM"},
                     "end_time": {"type": "string", "description": "Hora de fin HH:MM"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["class", "work", "meal", "other"],
+                        "description": "'class'=clase, 'work'=trabajo, 'meal'=comida/rutina diaria, 'other'=otro.",
+                    },
+                    "requires_transport": {
+                        "type": "boolean",
+                        "description": (
+                            "true si para llegar a esto el usuario necesita trasladarse (ej. ir a la "
+                            "universidad u oficina) — se usa para dejar holgura antes de proponerle "
+                            "empezar otra cosa justo después de que termine."
+                        ),
+                    },
                 },
-                "required": ["title", "weekday", "start_time", "end_time"],
+                "required": ["title", "weekday", "start_time", "end_time", "category"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_recurring_event_active",
+            "description": (
+                "Pausa o reactiva un evento recurrente sin borrarlo — para cuando el usuario avisa que "
+                "algo periódico no aplica por un tiempo (ej. 'esta semana no tengo clases, son de "
+                "vacaciones') y luego vuelve a aplicar."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "integer"},
+                    "active": {"type": "boolean"},
+                },
+                "required": ["event_id", "active"],
             },
         },
     },
