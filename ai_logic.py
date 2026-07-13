@@ -26,10 +26,11 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"\1", text)
     return text
 
-_SCHEDULING_CLAIM_PATTERN = re.compile(
-    r"agend|acordad|acordamos|confirmamos|queda(mos)?\s|arrancas?\s+a\s+las|empiezas?\s+a\s+las",
+_SCHEDULE_SETTLED_PATTERN = re.compile(
+    r"agend|acordad|acordamos|confirmamos|queda(mos)?\s|cuadrad|arranc|empiez",
     re.IGNORECASE,
 )
+_TIME_MENTION_PATTERN = re.compile(r"\d{1,2}(:\d{2})?\s?(am|pm)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE)
 _DONE_CLAIM_PATTERN = re.compile(r"termin|acab|complet|marc.{0,10}hecho", re.IGNORECASE)
 _GENERIC_CONFIRMATION_PATTERN = re.compile(r"confirm|guard|registr|anot", re.IGNORECASE)
 
@@ -60,7 +61,11 @@ def _needs_tool_backed_reply(reply: str, user_text: str, tools_called: set) -> b
     reply = reply or ""
     user_text = user_text or ""
 
-    if _SCHEDULING_CLAIM_PATTERN.search(reply) and "confirm_schedule_slot" not in tools_called:
+    if (
+        _SCHEDULE_SETTLED_PATTERN.search(reply)
+        and _TIME_MENTION_PATTERN.search(reply)
+        and "confirm_schedule_slot" not in tools_called
+    ):
         return True
     if _DONE_CLAIM_PATTERN.search(reply) and not ({"mark_task_done", "acknowledge_reminder"} & tools_called):
         return True
@@ -242,9 +247,12 @@ def _run_tool_call(user_id: int, tool_call) -> dict:
         return {"error": str(e)}
 
 
+MAX_CORRECTION_ATTEMPTS = 2
+
+
 def _chat_with_tools(user_id: int, messages: list, user_text: str) -> str:
     tools_called = set()
-    correction_attempted = False
+    correction_attempts = 0
 
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.chat.completions.create(
@@ -257,8 +265,8 @@ def _chat_with_tools(user_id: int, messages: list, user_text: str) -> str:
 
         if not message.tool_calls:
             reply = message.content or ""
-            if not correction_attempted and _needs_tool_backed_reply(reply, user_text, tools_called):
-                correction_attempted = True
+            if correction_attempts < MAX_CORRECTION_ATTEMPTS and _needs_tool_backed_reply(reply, user_text, tools_called):
+                correction_attempts += 1
                 messages.append({"role": "assistant", "content": reply})
                 messages.append(
                     {
@@ -356,6 +364,18 @@ def handle_user_message(user_id: int, text: str) -> str:
     return reply
 
 
+def _has_contact_today(history: list, tz: ZoneInfo) -> bool:
+    if not history:
+        return False
+    last = history[-1]
+    if not last.get("created_at"):
+        return False
+    try:
+        return db.parse_ts(last["created_at"]).astimezone(tz).date() == datetime.now(tz).date()
+    except ValueError:
+        return False
+
+
 def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
     user = db.get_user_by_id(user_id)
     history = db.get_recent_conversation(user_id, limit=10)
@@ -363,6 +383,10 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
     kind_instructions = {
         "outreach": "Es momento de preguntarle proactivamente por sus pendientes y ayudarlo a organizarse. "
                     "No lo agobies con todo a la vez si tiene varias tareas.",
+        "outreach_escalation": "Ya le preguntaste esto antes y no llegaron a nada concreto (nunca te confirmó "
+                                "un horario o un plan real). No repitas la misma pregunta genérica otra vez — "
+                                "reconoce que sigue sin decidirse y trata de cerrar algo concreto esta vez "
+                                "(un horario puntual), no otra pregunta abierta más.",
         "checkin": "Ya llegó la hora en la que habían quedado en que empezaría la tarea. Pregúntale de forma "
                    "natural si ya inició.",
         "escalation": "Ya le preguntaste antes y no respondió o dijo que no ha avanzado. Insiste, con más "
@@ -388,15 +412,39 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
                                      "simplemente no haya agarrado el celular.",
     }
 
+    tz = ZoneInfo(user.get("timezone") or "America/Lima")
+    already_talked_today = _has_contact_today(history, tz)
+    is_repeat_contact = kind.endswith("_escalation") or kind == "reminder_ack" or context.get("escalation_level", 0) > 0
+
+    continuity_rules = []
+    if already_talked_today:
+        continuity_rules.append(
+            "Ya hablaron hoy (revisa el historial) — NO abras con 'Buenos días', 'Buenas' ni ningún saludo "
+            "de plantilla, eso rompe la continuidad. Entra directo al grano o retoma la charla de forma "
+            "natural, como si fuera el mismo hilo de conversación (que lo es)."
+        )
+    if is_repeat_contact:
+        continuity_rules.append(
+            "Esta no es la primera vez que le escribes por esto sin que se resuelva — que se note: "
+            "reconoce que sigue sin responder o decidir, en vez de repetir la pregunta desde cero, con algo "
+            "natural tipo '¿sigues ahí?', 'aún espero tu respuesta', 'me avisas porfa cuando puedas' (son "
+            "solo ejemplos de tono, no los copies literal ni uses siempre los mismos)."
+        )
+    continuity_rules.append(
+        "Solo haz una pregunta si de verdad necesitas que decida o confirme algo para poder seguir. Si ya "
+        "te respondió lo suficiente antes y no hay nada nuevo que decidir, no le repreguntes lo mismo — "
+        "informa o avanza en vez de convertirlo en otra pregunta sin propósito."
+    )
+
     instruction = (
         f"{_system_prompt(user, user_id)}\n\n"
         f"No es el usuario quien te escribió: tú vas a iniciar la conversación ahora mismo.\n"
         f"{kind_instructions.get(kind, '')}\n\n"
+        f"{' '.join(continuity_rules)}\n\n"
         f"Contexto relevante: {json.dumps(context, default=str, ensure_ascii=False)}\n\n"
         "Responde solo con el mensaje que le vas a mandar, nada más."
     )
 
-    tz = ZoneInfo(user.get("timezone") or "America/Lima")
     messages = [{"role": "system", "content": instruction}] + _format_history_messages(history, tz)
     messages.append({"role": "user", "content": "(inicia tú la conversación ahora)"})
 

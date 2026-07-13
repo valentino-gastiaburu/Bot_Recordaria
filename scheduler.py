@@ -288,15 +288,26 @@ def _process_due_user(state: dict):
         db.update_scheduler_state(user_id, (now_utc + timedelta(hours=6)).isoformat(), None, None)
         return None
 
+    last_nudge = db.get_last_nudge_for_task(user_id, task["id"])
+    if last_nudge and last_nudge["kind"] in ("outreach", "outreach_escalation") and not last_nudge.get("user_responded_at"):
+        escalation_level = last_nudge["escalation_level"] + 1
+        kind = "outreach_escalation"
+    else:
+        escalation_level = 0
+        kind = "outreach"
+
     context = _augment_with_unresolved_thread(user_id, {
         "task": {"title": task["title"], "deadline_at": task.get("deadline_at")},
+        "escalation_level": escalation_level,
         "leisure_summary": db.get_recent_leisure_summary(user_id),
     })
-    message = ai_logic.redactar_nudge(user_id, "outreach", context)
+    message = ai_logic.redactar_nudge(user_id, kind, context)
 
-    db.log_nudge(user_id, task["id"], "outreach", message, 0)
+    db.log_nudge(user_id, task["id"], kind, message, escalation_level)
     db.append_conversation_message(user_id, "assistant", message)
-    db.update_scheduler_state(user_id, (now_utc + timedelta(minutes=30)).isoformat(), None, None)
+
+    next_delay = _next_follow_up_delay_min(escalation_level, task.get("deadline_at"), now_utc)
+    db.update_scheduler_state(user_id, (now_utc + timedelta(minutes=next_delay)).isoformat(), None, None)
 
     return user["telegram_chat_id"], message
 
