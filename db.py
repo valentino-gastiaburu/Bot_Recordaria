@@ -36,11 +36,14 @@ def _now_iso() -> str:
 
 # ---------- users ----------
 
-def get_or_create_user(chat_id: int, username: str | None) -> dict:
+def get_or_create_user(chat_id: int, username: str | None) -> tuple[dict, bool]:
+    """Devuelve (user, es_nuevo) — es_nuevo sirve para mandarle el mensaje de
+    bienvenida solo la primera vez que escribe, sin importar si entró con /start
+    o directo con un mensaje de texto."""
     client = get_client()
     existing = client.table("users").select("*").eq("telegram_chat_id", chat_id).execute()
     if existing.data:
-        return existing.data[0]
+        return existing.data[0], False
 
     inserted = client.table("users").insert(
         {"telegram_chat_id": chat_id, "telegram_username": username}
@@ -50,7 +53,7 @@ def get_or_create_user(chat_id: int, username: str | None) -> dict:
     client.table("user_scheduler_state").upsert(
         {"user_id": user["id"], "next_contact_at": _now_iso()}
     ).execute()
-    return user
+    return user, True
 
 
 def get_user_by_id(user_id: int) -> dict:
