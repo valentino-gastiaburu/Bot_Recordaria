@@ -40,17 +40,6 @@ def _strip_history_marker(text: str) -> str:
     acá como red de seguridad, igual que con el markdown."""
     return _HISTORY_MARKER_PATTERN.sub(" ", text or "").strip()
 
-_QUESTION_MARK_PATTERN = re.compile(r"\?")
-
-
-def _looks_like_awaiting_reply(reply: str) -> bool:
-    # Solo cuenta si el mensaje TERMINA en una pregunta real (permitiendo algo de
-    # puntuación/emoji decorativo después) — frases sueltas tipo "avísame cualquier
-    # cosa" como despedida casual no deben rearmar la insistencia rápida.
-    tail = (reply or "").rstrip()[-25:]
-    return bool(_QUESTION_MARK_PATTERN.search(tail))
-
-
 BASE_PERSONALITY = """
 Eres el asistente personal del usuario dentro de un chat de Telegram. Tu trabajo es ayudarlo a
 organizarse: conocer sus tareas pendientes, su horario (clases, exámenes, planes), acordar con él
@@ -293,24 +282,40 @@ def _chat_with_tools(user_id: int, messages: list) -> str:
     return "Uy, se me enredó un poco la cabeza organizando esto. ¿Me lo repites en un mensaje?"
 
 
-def _classify_intent(messages: list, reply: str) -> str:
-    """Llamado aparte y aislado (JSON forzado, sin tools) que decide qué código de
-    intención corresponde a este turno — su salida NUNCA se le muestra al usuario,
-    así que aunque el modelo divague dentro del JSON, eso no contamina la respuesta
-    real (a diferencia de pedirle el código embebido en el mismo texto de la
-    respuesta, que resultó nada confiable: DeepSeek mezclaba razonamiento visible con
-    el mensaje real). Si algo falla, el resultado seguro es "0000" (ninguna acción)."""
+def _classify_intent(messages: list, reply: str) -> tuple[str, bool]:
+    """Llamado aparte y aislado (JSON forzado, sin tools) que decide (a) qué código de
+    intención corresponde a este turno y (b) si la respuesta deja una pregunta
+    genuinamente abierta que necesita que el usuario conteste algo — su salida NUNCA
+    se le muestra al usuario, así que aunque el modelo divague dentro del JSON, eso
+    no contamina la respuesta real (a diferencia de pedirle el código embebido en el
+    mismo texto de la respuesta, que resultó nada confiable: DeepSeek mezclaba
+    razonamiento visible con el mensaje real).
+
+    Lo de "awaiting_reply" reemplaza una detección anterior por regex (buscar '?' en
+    los últimos 25 caracteres) que fallaba en casos reales: un mensaje puede traer la
+    pregunta real a la mitad y una frase de cierre después (ej. "¿Qué más tienes
+    pendiente? Cuéntame para organizar todo.") — el regex no la detectaba porque el
+    '?' quedaba fuera de la ventana final, y por lo tanto el bot dejaba de insistir
+    sobre una pregunta que en realidad sí hizo. Dejar que el modelo lo juzgue en este
+    llamado aislado es más confiable que perseguir cada variante de redacción.
+
+    Si algo falla, el resultado seguro es ("0000", False) — no genera ninguna acción
+    ni insistencia de más."""
     classification_messages = messages + [
         {"role": "assistant", "content": reply},
         {
             "role": "system",
             "content": (
                 "Con base en toda la conversación y en la respuesta que se le acaba de mandar al "
-                "usuario, decide qué código de intención de 4 dígitos corresponde a ESTE turno "
-                "(cuál acción interna hay que registrar, si alguna). Estos son los códigos "
-                f"disponibles:\n{intent_codes.codes_prompt_block()}\n\n"
-                'Responde EXCLUSIVAMENTE con un JSON de la forma {"code": "0001"}. Si no corresponde '
-                'ninguna acción, usa {"code": "0000"}. No expliques nada más.'
+                "usuario, decide dos cosas sobre ESTE turno:\n"
+                "1. Qué código de intención de 4 dígitos corresponde (cuál acción interna hay que "
+                f"registrar, si alguna). Estos son los códigos disponibles:\n{intent_codes.codes_prompt_block()}\n"
+                "2. Si esa respuesta deja una pregunta o pedido genuinamente abierto que necesita que "
+                "el usuario conteste algo concreto para poder seguir (true), o si ya quedó cerrado/"
+                "resuelto y no hace falta que responda nada (false) — no importa si técnicamente "
+                "termina con '?' o no, lo que importa es si de verdad espera una respuesta.\n\n"
+                'Responde EXCLUSIVAMENTE con un JSON de la forma {"code": "0001", "awaiting_reply": '
+                'true}. Si no corresponde ninguna acción, usa code "0000". No expliques nada más.'
             ),
         },
     ]
@@ -323,9 +328,11 @@ def _classify_intent(messages: list, reply: str) -> str:
         )
         data = json.loads(response.choices[0].message.content or "{}")
         code = str(data.get("code", "0000"))
+        awaiting_reply = bool(data.get("awaiting_reply", False))
     except Exception:
-        return "0000"
-    return code if code in intent_codes.INTENT_CODES else "0000"
+        return "0000", False
+    code = code if code in intent_codes.INTENT_CODES else "0000"
+    return code, awaiting_reply
 
 
 def _execute_intent(user_id: int, code: str, messages: list) -> list:
@@ -419,7 +426,7 @@ def handle_user_message(user_id: int, text: str) -> str:
 
     try:
         reply = _chat_with_tools(user_id, messages)
-        code = _classify_intent(messages, reply)
+        code, awaiting_reply = _classify_intent(messages, reply)
     except Exception as e:
         if "429" in str(e):
             return "⚠️ El servidor está algo saturado. Reintenta en unos segundos."
@@ -438,7 +445,7 @@ def handle_user_message(user_id: int, text: str) -> str:
     state = db.get_scheduler_state(user_id)
     if state and state.get("pending_nudge_kind"):
         pass  # una acción de este turno (confirm_schedule_slot/mark_task_in_progress/log_deferral) ya fijó el cursor
-    elif _looks_like_awaiting_reply(reply):
+    elif awaiting_reply:
         db.set_awaiting_reply(user_id)
     else:
         db.bump_cooldown_if_idle(user_id)
