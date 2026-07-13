@@ -393,3 +393,12 @@ TOOLS = [
         },
     },
 ]
+
+
+# Tools de solo lectura: se dejan disponibles libremente durante la charla (stage 1),
+# no mutan estado asi que no tienen el riesgo de "confirmacion falsa" que motivo el
+# esquema de codigos de intencion (ver intent_codes.py).
+READ_TOOL_NAMES = {"list_pending_tasks", "propose_schedule_slot", "get_schedule", "get_recent_leisure_summary"}
+
+TOOLS_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+READ_TOOLS = [t for t in TOOLS if t["function"]["name"] in READ_TOOL_NAMES]

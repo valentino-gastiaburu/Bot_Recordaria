@@ -8,8 +8,9 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 import db
+import intent_codes
 import tools as tools_module
-from tools import TOOLS, TOOL_FUNCTIONS
+from tools import TOOL_FUNCTIONS
 
 load_dotenv()
 API_KEY = os.getenv("IA_KEY")
@@ -26,25 +27,18 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r"(?<!\w)_(\S.*?\S|\S)_(?!\w)", r"\1", text)
     return text
 
-_SCHEDULE_SETTLED_PATTERN = re.compile(
-    r"agend|acordad|acordamos|confirmamos|queda(mos)?\s|cuadrad|arranc|empiez",
-    re.IGNORECASE,
-)
-_TIME_MENTION_PATTERN = re.compile(r"\d{1,2}(:\d{2})?\s?(am|pm)\b|\b\d{1,2}:\d{2}\b", re.IGNORECASE)
-_DONE_CLAIM_PATTERN = re.compile(r"termin|acab|complet|marc.{0,10}hecho", re.IGNORECASE)
-_GENERIC_CONFIRMATION_PATTERN = re.compile(r"confirm|guard|registr|anot", re.IGNORECASE)
 
-_DEFERRAL_SIGNAL_PATTERN = re.compile(
-    r"cansad|jugar|despu[eé]s|un rato|no quiero|ahorita no|luego lo hago|al rato|m[aá]s tarde|no tengo ganas",
-    re.IGNORECASE,
+_HISTORY_MARKER_PATTERN = re.compile(
+    r"\s*\[[A-Za-zÁÉÍÓÚáéíóúñÑ]+ \d{1,2}/\d{1,2} \d{1,2}:\d{2}\]\s*"
 )
 
-_START_SIGNAL_PATTERN = re.compile(
-    r"ya empec|ya estoy haciendo|lo estoy haciendo|ya arranqu",
-    re.IGNORECASE,
-)
 
-_FINISH_SIGNAL_PATTERN = re.compile(r"ya termin|ya acab|ya lo hice", re.IGNORECASE)
+def _strip_history_marker(text: str) -> str:
+    """_format_history_messages antepone '[lunes 13/07 09:43]' a cada mensaje del
+    historial para que el modelo ubique fechas — pese a la instrucción de tratarlo
+    como metadata invisible, a veces lo repite tal cual en su respuesta. Se limpia
+    acá como red de seguridad, igual que con el markdown."""
+    return _HISTORY_MARKER_PATTERN.sub(" ", text or "").strip()
 
 _QUESTION_MARK_PATTERN = re.compile(r"\?")
 
@@ -56,28 +50,6 @@ def _looks_like_awaiting_reply(reply: str) -> bool:
     tail = (reply or "").rstrip()[-25:]
     return bool(_QUESTION_MARK_PATTERN.search(tail))
 
-
-def _needs_tool_backed_reply(reply: str, user_text: str, tools_called: set) -> bool:
-    reply = reply or ""
-    user_text = user_text or ""
-
-    if (
-        _SCHEDULE_SETTLED_PATTERN.search(reply)
-        and _TIME_MENTION_PATTERN.search(reply)
-        and "confirm_schedule_slot" not in tools_called
-    ):
-        return True
-    if _DONE_CLAIM_PATTERN.search(reply) and not ({"mark_task_done", "acknowledge_reminder"} & tools_called):
-        return True
-    if _GENERIC_CONFIRMATION_PATTERN.search(reply) and not tools_called:
-        return True
-    if _DEFERRAL_SIGNAL_PATTERN.search(user_text) and "log_deferral" not in tools_called:
-        return True
-    if _START_SIGNAL_PATTERN.search(user_text) and "mark_task_in_progress" not in tools_called:
-        return True
-    if _FINISH_SIGNAL_PATTERN.search(user_text) and not ({"mark_task_done", "acknowledge_reminder"} & tools_called):
-        return True
-    return False
 
 BASE_PERSONALITY = """
 Eres el asistente personal del usuario dentro de un chat de Telegram. Tu trabajo es ayudarlo a
@@ -91,53 +63,78 @@ una base de datos hablando. También prohibido narrar tu propio proceso entre pa
 meta, tipo "(revisando la conversación anterior...)" o "(pensando...)" — directamente dile lo que
 le tengas que decir, como lo haría una persona. Todo se siente como una conversación normal.
 
+Sé breve. La mayoría de tus respuestas deben ser 1-3 frases cortas, como un mensaje de WhatsApp
+real — nunca un párrafo largo explicando de más. Responde en el mismo tono y largo que el mensaje
+del usuario: si te escribió algo corto, contesta corto; no infles la respuesta con relleno,
+repeticiones o resúmenes de lo que ya se dijo. No termines cada mensaje con una pregunta de cortesía
+tipo "¿algo más en que te ayude?" — solo pregunta cuando de verdad necesitas que decida o confirme
+algo para poder seguir.
+
+No anuncies la hora o fecha ACTUAL como apertura decorativa o de relleno (nada de arrancar un mensaje
+con "son las 3pm", "hoy lunes 13...", "ahora mismo son las..." porque sí). Igual la conoces y la
+usas para calcular todo internamente (horarios, si algo ya venció, cuánto falta) — no hace falta
+repetirla como dato suelto. Dicho esto, sí puedes mencionarla cuando hay una razón real para que el
+usuario la necesite (ej. explicarle por qué el horario que pidió ya pasó, o qué horas van en un
+horario que estás negociando o confirmando) — ahí sí, de forma breve y funcional, como lo haría
+cualquier persona coordinando un plan.
+
+IMPORTANTE sobre cómo funciona esto por dentro: en esta parte de la charla solo tienes herramientas
+de CONSULTA (list_pending_tasks, propose_schedule_slot, get_schedule, get_recent_leisure_summary) —
+no tienes ninguna herramienta para crear, editar, agendar o marcar nada, y esto es intencional, no
+un error ni algo que debas resolver o mencionar. Un mecanismo aparte, automático, decide después de
+tu respuesta qué hay que registrar según lo que se habló — vos no te encargas de eso ni necesitas
+saber cómo funciona. Cuando más abajo se dice que "algo debe quedar registrado", es una descripción
+de qué tiene que pasar en el sistema, NO una instrucción para que vos llames una herramienta o te
+preocupes por el mecanismo — tú solo sigue la charla con naturalidad, como si ya estuviera resuelto.
+Nunca dudes en voz alta sobre qué herramienta usar ni digas que no tienes forma de registrar algo:
+eso no es tu problema, simplemente habla con el usuario con toda naturalidad.
+
 Cuando el usuario menciona algo que tiene que hacer, pregúntale (en su momento, no todo de golpe)
 cuánto cree que le tomará. En cuanto responda con un tiempo (aunque sea aproximado, "una hora",
-"un rato"), llama a set_task_estimate ANTES de decir nada más — nunca sigas la conversación con
-ese dato en la cabeza sin haberlo guardado. Recién después, y usando propose_schedule_slot para
-revisar que no choque con nada de su horario, propónle un horario. No le impongas un horario:
-propónselo y negocia si no le viene bien.
+"un rato"), ese estimado debe quedar registrado — nunca sigas la conversación con ese dato en la
+cabeza sin haberlo guardado. Recién después, y usando propose_schedule_slot para revisar que no
+choque con nada de su horario, propónle un horario. No le impongas un horario: propónselo y negocia
+si no le viene bien.
 
-Antes de llamar a create_task, revisa con list_pending_tasks si la tarea de la que están hablando
-ya existe (por el mismo tema, aunque el usuario la mencione con otras palabras o dé más detalles
-después). Si ya existe, usa update_task con su task_id para agregar/corregir información — jamás
-crees una tarea duplicada para algo de lo que ya venían hablando.
+Antes de dar por hecho que hay que crear un pendiente nuevo, revisa con list_pending_tasks si la
+tarea de la que están hablando ya existe (por el mismo tema, aunque el usuario la mencione con
+otras palabras o dé más detalles después). Si ya existe, edítala con su task_id para
+agregar/corregir información — jamás crees una tarea duplicada para algo de lo que ya venían
+hablando.
 
-Hay tres tipos de pendiente (parámetro "kind" de create_task, obligatorio elegir uno):
+Hay tres tipos de pendiente ("kind", obligatorio elegir uno al crear uno):
 - "reminder": el usuario solo necesita que le avises algo en un momento dado, sin trabajo real de
   por medio (ej. "recuérdame llamar al dentista a las 3pm"). No le preguntes cuánto le tomará ni le
-  niegocies un horario de trabajo. IMPORTANTE: la hora en la que debe avisársele va SIEMPRE en
-  confirm_schedule_slot (start_at), NUNCA en deadline_at — un reminder no tiene deadline, tiene una
-  hora de aviso. O sea: create_task(kind="reminder") y de inmediato confirm_schedule_slot(task_id,
-  start_at=<la hora que dio el usuario>), en el mismo turno si es posible. Solo di "listo, te aviso a
-  tal hora" si confirm_schedule_slot ya tuvo éxito. Cuando llegue esa hora, el sistema le manda el
-  recordatorio automáticamente. Este tipo SOLO se cierra con acknowledge_reminder, y solo cuando el
-  usuario confirme explícitamente que lo vio/entendió (ej. "ok ya vi", "entendido") — una respuesta
-  ambigua o que no confirme claramente NO cuenta, vuelve a preguntar. Nunca uses mark_task_done para
-  un reminder.
+  niegocies un horario de trabajo. IMPORTANTE: la hora en la que debe avisársele va SIEMPRE como el
+  horario acordado (start_at), NUNCA como deadline — un reminder no tiene deadline, tiene una hora
+  de aviso. O sea: cuando el usuario da un reminder nuevo con su horario ya claro en el mismo
+  mensaje, debe quedar creado Y agendado de una, en el mismo turno. Solo di "listo, te aviso a tal
+  hora" si eso de verdad va a quedar registrado así. Cuando llegue esa hora, el sistema le manda el
+  recordatorio automáticamente. Este tipo SOLO se cierra cuando el usuario confirme explícitamente
+  que lo vio/entendió (ej. "ok ya vi", "entendido") — una respuesta ambigua o que no confirme
+  claramente NO cuenta, vuelve a preguntar. Un reminder nunca se marca "terminado", se marca "visto".
 - "assignment": tiene una fecha límite externa dura (examen, entrega, presentación). Pregúntale si
   hay fechas intermedias importantes además del deadline final (ej. "¿tu parte del grupal tiene que
-  estar lista antes?") y guárdalas con add_task_milestone — puede haber varias.
+  estar lista antes?") y regístralas como hitos — puede haber varios.
 - "agreement": todo lo demás — algo que tiene que hacer pero sin fecha límite externa impuesta por
   alguien más.
 
 Cuando el usuario confirme que ya empezó una tarea (aunque sea de pasada, "ya le entré", "ya estoy
-en eso"), llama a mark_task_in_progress EN ESE MISMO TURNO. Cuando confirme que la terminó, llama a
-mark_task_done EN ESE MISMO TURNO (nunca para un reminder, ver arriba). No lo dejes para después ni
-asumas que "ya quedó claro" sin haber llamado la herramienta.
+en eso"), eso debe quedar registrado EN ESE MISMO TURNO. Cuando confirme que la terminó, debe quedar
+marcada como terminada EN ESE MISMO TURNO (nunca un reminder, ver arriba). No lo dejes para después
+ni asumas que "ya quedó claro" sin que haya quedado de verdad registrado.
 
 No eres completamente tolerante. Si el usuario quiere posponer/descansar/jugar en vez de avanzar,
-llama a log_deferral EN ESE MISMO TURNO (siempre, sin excepción) con los minutos/motivo que haya
-dado, antes de responder. Nunca hables de "veces que ya pospuso" o de un patrón de descansos sin
-haber llamado a get_recent_leisure_summary primero y ver el resultado real — si no lo has llamado,
-no sabes si pospuso antes, así que no lo inventes. Está bien ceder la primera vez, pero si el
-resumen real muestra varios descansos/deferrals recientes, puedes ser más firme y cuestionarlo un
-poco más, siempre en tono natural, no como una regla robótica.
+eso debe quedar registrado EN ESE MISMO TURNO (siempre, sin excepción). Nunca hables de "veces que
+ya pospuso" o de un patrón de descansos sin haber llamado a get_recent_leisure_summary primero y ver
+el resultado real — si no lo has llamado, no sabes si pospuso antes, así que no lo inventes. Está
+bien ceder la primera vez, pero si el resumen real muestra varios descansos/deferrals recientes,
+puedes ser más firme y cuestionarlo un poco más, siempre en tono natural, no como una regla
+robótica.
 
-Nunca digas que guardaste, agendaste o marcaste algo como hecho si no llamaste a la herramienta
-correspondiente y esta tuvo éxito en este mismo turno. Si necesitas datos (tareas pendientes,
-horario, resumen de descansos) para responder bien, usa las herramientas antes de contestar en vez
-de inventar.
+Nunca digas que guardaste, agendaste o marcaste algo como hecho si eso no quedó de verdad registrado
+en este turno. Si necesitas datos (tareas pendientes, horario, resumen de descansos) para responder
+bien, usa las herramientas de consulta antes de contestar en vez de inventar.
 
 La lista de "tareas ya registradas" que te doy más abajo es la ÚNICA fuente confiable de qué está
 realmente agendado — el historial de conversación puede contener cosas que se discutieron pero
@@ -151,11 +148,16 @@ del usuario" en este mismo mensaje. Si vas a mencionar cuánto falta para algo, 
 de esa hora real, nunca de una que te parezca lógica por el contexto de la charla.
 
 Cada mensaje del historial de abajo trae al inicio, entre corchetes, el día y hora real en que se
-mandó, ej. "[lunes 13/07 09:43]". Compara esa fecha con la de HOY (arriba) antes de dar por vigente
-algo que se dijo antes. Si un mensaje viejo dice "hoy" o "esta noche" pero se mandó en un día
-distinto al de hoy, ese plan quedó obsoleto — no lo repitas como si siguiera en pie, replantéalo con
-el usuario. Vuelve a mirar la lista de tareas registradas (la fuente real) en vez de fiarte de lo
-que el chat viejo diga sobre horarios.
+mandó, ej. "[lunes 13/07 09:43]". Eso es SOLO una etiqueta de metadata para que tú ubiques cuándo se
+dijo cada cosa — no es parte de lo que la persona escribió ni algo que el usuario pueda ver o haya
+mandado. Nunca la menciones, la cites, la confundas con un mensaje nuevo, ni reacciones a ella como
+si fuera contenido de la charla (ej. nunca digas algo como "eso que pusiste no es un mensaje nuevo,
+es la hora actual" — el usuario no ve esas etiquetas, así que una frase así no tiene sentido para
+él). Simplemente úsala en silencio para comparar esa fecha con la de HOY (arriba) antes de dar por
+vigente algo que se dijo antes. Si un mensaje viejo dice "hoy" o "esta noche" pero se mandó en un
+día distinto al de hoy, ese plan quedó obsoleto — no lo repitas como si siguiera en pie, replantéalo
+con el usuario. Vuelve a mirar la lista de tareas registradas (la fuente real) en vez de fiarte de
+lo que el chat viejo diga sobre horarios.
 
 Telegram NO interpreta ** ni _ como negrita ni cursiva — si los usas, al usuario le aparecen
 asteriscos o guiones bajos sueltos, feo y confuso. No uses NINGÚN formato tipo markdown (nada de
@@ -170,10 +172,10 @@ quedarte hasta las 3am, ¿te parece o prefieres ajustar algo?" — no se lo esco
 silencio proponiendo un plan que en realidad no alcanza.
 
 Cuando el usuario mencione un examen, clase u otro evento con una hora de inicio, pregúntale
-también a qué hora termina (o cuánto dura) y regístralo con add_one_off_event — no solo guardes el
-deadline_at de la tarea. Así ese bloque de tiempo queda marcado como ocupado de verdad para cuando
-propongas horarios de estudio más adelante. Antes de llamar a add_one_off_event, revisa con
-get_schedule si ese evento ya está registrado (mismo título/fecha) — si ya existe, no lo dupliques.
+también a qué hora termina (o cuánto dura) y regístralo como evento puntual — no solo guardes el
+deadline de la tarea. Así ese bloque de tiempo queda marcado como ocupado de verdad para cuando
+propongas horarios de estudio más adelante. Antes de eso, revisa con get_schedule si ese evento ya
+está registrado (mismo título/fecha) — si ya existe, no lo dupliques.
 """.strip()
 
 
@@ -194,10 +196,10 @@ def _pending_tasks_context(user_id: int) -> str:
             line += f"\n    hito: \"{m['label']}\" a las {m['at']}"
         lines.append(line)
     return (
-        "Tareas que el usuario ya tiene registradas (estos son sus id reales — reutilízalos con "
-        "update_task/set_task_estimate/confirm_schedule_slot/mark_task_in_progress/mark_task_done; "
-        "NUNCA llames create_task para algo que ya está en esta lista, aunque el usuario lo mencione "
-        "con otras palabras o agregue detalles nuevos):\n" + "\n".join(lines)
+        "Tareas que el usuario ya tiene registradas (estos son sus id reales — reutilízalos en los "
+        "códigos de editar/estimar/confirmar horario/marcar en progreso/marcar terminado; NUNCA uses "
+        "el código de crear pendiente para algo que ya está en esta lista, aunque el usuario lo "
+        "mencione con otras palabras o agregue detalles nuevos):\n" + "\n".join(lines)
     )
 
 
@@ -247,45 +249,22 @@ def _run_tool_call(user_id: int, tool_call) -> dict:
         return {"error": str(e)}
 
 
-MAX_CORRECTION_ATTEMPTS = 2
-
-
-def _chat_with_tools(user_id: int, messages: list, user_text: str) -> str:
-    tools_called = set()
-    correction_attempts = 0
-
+def _chat_with_tools(user_id: int, messages: list) -> str:
+    """El modelo conversa libremente con las tools de solo lectura hasta producir su
+    respuesta final en texto plano, normal, para el usuario — sin ningún código
+    embebido (eso se decide aparte, ver _classify_intent)."""
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
-            tools=TOOLS,
+            tools=tools_module.READ_TOOLS,
             temperature=0.8,
         )
         message = response.choices[0].message
 
         if not message.tool_calls:
-            reply = message.content or ""
-            if correction_attempts < MAX_CORRECTION_ATTEMPTS and _needs_tool_backed_reply(reply, user_text, tools_called):
-                correction_attempts += 1
-                messages.append({"role": "assistant", "content": reply})
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Revisa tu respuesta: suena a que confirmaste/agendaste/guardaste/terminaste "
-                            "algo, o el usuario te pidió posponer/dijo que ya empezó o terminó, pero no "
-                            "llamaste la herramienta específica que corresponde a eso en este turno (ej. "
-                            "confirm_schedule_slot para agendar, mark_task_done/acknowledge_reminder para "
-                            "cerrar, log_deferral para posponer, mark_task_in_progress para 'ya empecé'). "
-                            "Llama ahora la herramienta correcta antes de responder. No inventes datos sin "
-                            "haber llamado la herramienta que los consulta de verdad."
-                        ),
-                    }
-                )
-                continue
-            return reply
+            return message.content or ""
 
-        tools_called.update(tc.function.name for tc in message.tool_calls)
         messages.append(
             {
                 "role": "assistant",
@@ -312,6 +291,103 @@ def _chat_with_tools(user_id: int, messages: list, user_text: str) -> str:
             )
 
     return "Uy, se me enredó un poco la cabeza organizando esto. ¿Me lo repites en un mensaje?"
+
+
+def _classify_intent(messages: list, reply: str) -> str:
+    """Llamado aparte y aislado (JSON forzado, sin tools) que decide qué código de
+    intención corresponde a este turno — su salida NUNCA se le muestra al usuario,
+    así que aunque el modelo divague dentro del JSON, eso no contamina la respuesta
+    real (a diferencia de pedirle el código embebido en el mismo texto de la
+    respuesta, que resultó nada confiable: DeepSeek mezclaba razonamiento visible con
+    el mensaje real). Si algo falla, el resultado seguro es "0000" (ninguna acción)."""
+    classification_messages = messages + [
+        {"role": "assistant", "content": reply},
+        {
+            "role": "system",
+            "content": (
+                "Con base en toda la conversación y en la respuesta que se le acaba de mandar al "
+                "usuario, decide qué código de intención de 4 dígitos corresponde a ESTE turno "
+                "(cuál acción interna hay que registrar, si alguna). Estos son los códigos "
+                f"disponibles:\n{intent_codes.codes_prompt_block()}\n\n"
+                'Responde EXCLUSIVAMENTE con un JSON de la forma {"code": "0001"}. Si no corresponde '
+                'ninguna acción, usa {"code": "0000"}. No expliques nada más.'
+            ),
+        },
+    ]
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=classification_messages,
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+        code = str(data.get("code", "0000"))
+    except Exception:
+        return "0000"
+    return code if code in intent_codes.INTENT_CODES else "0000"
+
+
+def _execute_intent(user_id: int, code: str, messages: list) -> list:
+    """Stage 2: por cada acción que implica el código, fuerza (tool_choice) que el
+    modelo llene los argumentos de esa función exacta y la ejecuta de verdad — no
+    depende de que el modelo haya llamado la tool por su cuenta en el stage 1.
+
+    Para códigos combinados (ej. crear + agendar), el resultado de cada acción se
+    encadena a las siguientes, para que la 2da acción vea el task_id que acaba de
+    crear la 1ra en vez de tener que adivinarlo."""
+    results = []
+    working_messages = list(messages)
+
+    for tool_name in intent_codes.actions_for_code(code):
+        tool_schema = tools_module.TOOLS_BY_NAME.get(tool_name)
+        if not tool_schema:
+            continue
+
+        working_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"Llama ahora exactamente a la función {tool_name} con los argumentos que "
+                    "correspondan según la conversación reciente y los resultados de acciones "
+                    "anteriores en este mismo turno (ej. el task_id que se acaba de crear)."
+                ),
+            }
+        )
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=working_messages,
+            tools=[tool_schema],
+            tool_choice={"type": "function", "function": {"name": tool_name}},
+            temperature=0.2,
+        )
+        message = response.choices[0].message
+        if not message.tool_calls:
+            results.append({"tool": tool_name, "error": "no_tool_call_emitted"})
+            continue
+
+        tc = message.tool_calls[0]
+        result = _run_tool_call(user_id, tc)
+        results.append({"tool": tool_name, "result": result})
+
+        working_messages.append(
+            {
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                ],
+            }
+        )
+        working_messages.append(
+            {"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result, default=str)}
+        )
+
+    return results
 
 
 def handle_user_message(user_id: int, text: str) -> str:
@@ -342,7 +418,8 @@ def handle_user_message(user_id: int, text: str) -> str:
     messages = [{"role": "system", "content": system_prompt}] + _format_history_messages(history, tz)
 
     try:
-        reply = _chat_with_tools(user_id, messages, text)
+        reply = _chat_with_tools(user_id, messages)
+        code = _classify_intent(messages, reply)
     except Exception as e:
         if "429" in str(e):
             return "⚠️ El servidor está algo saturado. Reintenta en unos segundos."
@@ -350,12 +427,17 @@ def handle_user_message(user_id: int, text: str) -> str:
             return "⚠️ Revisa tu saldo en DeepSeek o el límite de tu API Key."
         return f"Error de conexión: {str(e)}"
 
-    reply = _strip_markdown(reply)
+    if code != "0000":
+        action_results = _execute_intent(user_id, code, messages)
+        if any("error" in r for r in action_results):
+            reply += "\n\n(Uy, creo que no logré guardar bien algo de esto — dime si quedó mal y lo corrijo.)"
+
+    reply = _strip_history_marker(_strip_markdown(reply))
     db.append_conversation_message(user_id, "assistant", reply)
 
     state = db.get_scheduler_state(user_id)
     if state and state.get("pending_nudge_kind"):
-        pass  # una tool de este turno (confirm_schedule_slot/mark_task_in_progress/log_deferral) ya fijó el cursor
+        pass  # una acción de este turno (confirm_schedule_slot/mark_task_in_progress/log_deferral) ya fijó el cursor
     elif _looks_like_awaiting_reply(reply):
         db.set_awaiting_reply(user_id)
     else:
@@ -382,7 +464,10 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
 
     kind_instructions = {
         "outreach": "Es momento de preguntarle proactivamente por sus pendientes y ayudarlo a organizarse. "
-                    "No lo agobies con todo a la vez si tiene varias tareas.",
+                    "No lo agobies con todo a la vez si tiene varias tareas. Si no tiene nada registrado "
+                    "todavía o parece que ya resolvió lo que tenía, es buen momento para preguntarle algo "
+                    "como '¿qué más tienes que hacer? cuéntame' (con tus palabras, no la copies literal) "
+                    "para enterarte de más pendientes.",
         "outreach_escalation": "Ya le preguntaste esto antes y no llegaron a nada concreto (nunca te confirmó "
                                 "un horario o un plan real). No repitas la misma pregunta genérica otra vez — "
                                 "reconoce que sigue sin decidirse y trata de cerrar algo concreto esta vez "
@@ -453,4 +538,4 @@ def redactar_nudge(user_id: int, kind: str, context: dict) -> str:
         messages=messages,
         temperature=0.8,
     )
-    return _strip_markdown(response.choices[0].message.content or "")
+    return _strip_history_marker(_strip_markdown(response.choices[0].message.content or ""))
